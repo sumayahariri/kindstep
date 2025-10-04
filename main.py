@@ -10,28 +10,63 @@ import platform
 import random
 import requests
 import threading
+import cv2
+import torch
+import numpy as np
+from ultralytics import YOLO
+from PIL import Image
+import time
+import matplotlib.pyplot as plt
+from queue import Queue
 
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "credentials.json"
 client = speech.SpeechClient()
 MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY", "bUVaaEEK4hfvE2ekIRTdM0eYA3Schtbk")
+yolo_coco = YOLO("yolov8m.pt")
+yolo_model = YOLO("yolov8m_200aug3\\weights\\best.pt")
 
 RATE = 16000
-CHUNK = int(RATE / 20)  
+CHUNK = int(RATE / 20)
 
-tts_engine = pyttsx3.init()
-tts_engine.setProperty('rate', 170)
+import threading
+from queue import Queue
+import pyttsx3
+import time
 
-tts_engine.say("")
-tts_engine.runAndWait()
+speak_queue = Queue()
+is_listening = threading.Event()
+is_listening.set()
+
+def tts_worker():
+    while True:
+        text = speak_queue.get()
+        if text is None:
+            break
+        try:
+            is_listening.clear()
+            print(f"Assistant: {text}")
+            # fresh engine each time prevents blocking
+            engine = pyttsx3.init()
+            engine.setProperty('rate', 175)
+            engine.say(text)
+            engine.runAndWait()
+            engine.stop()
+            del engine
+            time.sleep(0.3)
+        except Exception as e:
+            print(f"[TTS ERROR] {e}")
+        finally:
+            is_listening.set()
+            speak_queue.task_done()
+
+threading.Thread(target=tts_worker, daemon=True).start()
 
 def speak(text):
-    """Threaded speech so text prints immediately while speaking."""
-    def _speak():
-        tts_engine.say(text)
-        tts_engine.runAndWait()
-    print(f"Assistant: {text}")
-    sys.stdout.flush()
-    threading.Thread(target=_speak, daemon=True).start()
+    speak_queue.put(text)
+
+def stop_tts():
+    speak_queue.put(None)
+
 
 def mic_stream():
     audio_interface = pyaudio.PyAudio()
@@ -42,14 +77,25 @@ def mic_stream():
         input=True,
         frames_per_buffer=CHUNK,
     )
+
+    silence = (np.zeros(CHUNK)).astype(np.int16).tobytes()
+
     try:
         while True:
-            yield speech.StreamingRecognizeRequest(audio_content=stream.read(CHUNK))
+            if not is_listening.is_set():
+                # send silence instead of stopping the stream
+                yield speech.StreamingRecognizeRequest(audio_content=silence)
+                #time.sleep(0.1)
+                continue
+
+            audio_data = stream.read(CHUNK, exception_on_overflow=False)
+            yield speech.StreamingRecognizeRequest(audio_content=audio_data)
     except KeyboardInterrupt:
         stream.stop_stream()
         stream.close()
         audio_interface.terminate()
         raise StopIteration
+
 
 def get_greeting():
     hour = datetime.now().hour
@@ -96,6 +142,82 @@ def ask_mistral(query):
         print(f"Unexpected error: {e}")
         return "Sorry, something went wrong. Please try again."
 
+def load_zoedepth():
+    repo = "isl-org/ZoeDepth"
+    model = torch.hub.load(repo, "ZoeD_NK", pretrained=True)
+    model = model.to("cuda") 
+    model.eval()
+    return model
+
+model_depth = load_zoedepth()
+
+def predict_depth(model, image_pil):
+    with torch.no_grad():
+        depth = model.infer_pil(image_pil) 
+    return depth
+
+
+def estimate_distance(depth_map, box):
+    x1, y1, x2, y2 = map(int, box)
+    crop = depth_map[y1:y2, x1:x2]
+    if crop.size == 0:
+        return None
+    return np.median(crop)
+
+def describe_detection(obj_class, box, depth_map, image_w, image_h):
+    distance = estimate_distance(depth_map, box)
+    if distance is None:
+        return f"{obj_class} not measurable"
+
+    cx = (box[0] + box[2]) / 2
+    rel_x = (cx - image_w / 2) / (image_w / 2)
+
+    if rel_x < -0.33:
+        direction = "9 o’clock (left)"
+    elif rel_x > 0.33:
+        direction = "3 o’clock (right)"
+    else:
+        direction = "12 o’clock (ahead)"
+
+    return f"{obj_class} at {direction}, approximately {distance:.2f} meters"
+
+def capture():
+    cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+    ret, frame = cap.read()
+    cap.release()
+
+    if ret:
+        speak("Frame captured")
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+        #plt.figure(figsize=(8,6))
+        #plt.imshow(frame_rgb)
+        #plt.axis("off")
+        #plt.title("Captured Frame")
+        #plt.show()
+
+        image_pil = Image.fromarray(frame_rgb)
+        image_w, image_h = image_pil.size
+
+        results_coco = yolo_coco.predict(frame, imgsz=640, conf=0.25, device=0, verbose=False)
+        results_custom = yolo_model.predict(frame, imgsz=640, conf=0.25, device=0, verbose=False)
+
+        image_pil_small = image_pil.resize((512, 512))
+        depth_map = predict_depth(model_depth, image_pil_small)
+
+        for model_name, results in [("COCO", results_coco), ("Custom", results_custom)]:
+            for r in results:
+                boxes = r.boxes.xyxy.cpu().numpy()
+                clss = r.boxes.cls.cpu().numpy().astype(int)
+
+                for box, cls_id in zip(boxes, clss):
+                    obj_class = (yolo_coco.names if model_name=="COCO" else yolo_model.names)[cls_id]
+                    description = describe_detection(obj_class, box, depth_map, image_w, image_h)
+                    speak(f"{description}")
+    else:
+        speak("No frame captured")
+
+
 def handle_query(query):
     query_lower = query.lower()
 
@@ -115,7 +237,7 @@ def handle_query(query):
         speak(f"Today is {today}")
 
     elif "battery" in query_lower:
-        try:
+        try:    
             battery = psutil.sensors_battery()
             if battery:
                 percent = battery.percent
@@ -131,7 +253,7 @@ def handle_query(query):
             "My name is KindStep. I'm your AI-powered voice assistant.",
             "I am KindStep, your personal assistant powered by artificial intelligence.",
             "I am here to help you with daily tasks and answer your questions.",
-            "I'm KindStep. I assist with time, date, battery status, and can answer any questions you have."
+        "I'm KindStep. I assist with time, date, battery status, and can answer any questions you have."
         ]
         speak(random.choice(responses))
 
@@ -147,9 +269,16 @@ def handle_query(query):
     elif "help" in query_lower:
         speak("You can ask me about time, date, battery, or any question you have. I'm powered by AI so feel free to ask me anything. Say exit to quit.")
 
+    elif any(phrase in query_lower for phrase in ["read what's in front of me", "read what is in front of me", "read"]):
+        pass
+
+    elif any(phrase in query_lower for phrase in ["what's in front of me", "what is in front of me", "in front of me", "distance between me and", "what's the distance", "distance to object", "how far is the object", "distance between me and the object next to me", "distance", "object"]):
+        capture()
+
     else:
         answer = ask_mistral(query)
         speak(answer)
+
 
 try:
     print("\n" + "═" * 70)
